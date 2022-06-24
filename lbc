@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+
+from argparse import ArgumentParser
+from copy import deepcopy
+import os
+from shutil import get_terminal_size
+import sys
+from traceback import format_exc
+
+from pycparser import c_parser, c_ast
+from pycparserext.ext_c_parser import GnuCParser
+from pycparserext.ext_c_generator import GnuCGenerator
+
+from pprint import pprint
+
+global rc
+
+def branch():
+    """ Branch execution flow
+
+        Use this function to split the execution flow.
+        The parent waits for the child to finish.
+
+        Returns True from the child, False from the parent.
+    """
+    pid = os.fork()
+    if pid == 0:
+        # child
+        return True
+    elif pid != -1:
+        # parent
+        _, status = os.waitpid(pid, 0)
+        global rc
+        rc |= os.waitstatus_to_exitcode(status)
+        return False
+
+    return False
+
+def get_nodes(node, *ast_types):
+    """ Get all sub-nodes of all type ast_types from node. """
+    if node is None:
+        return
+
+    nodes = []
+    for child in [item[1] for item in node.children()]:
+        found=False
+        for ast_type in ast_types:
+            if isinstance(child, ast_type):
+                nodes.append(child)
+                found=True
+        if not found:
+            nodes += get_nodes(child, ast_type)
+
+    return nodes
+
+
+class ProcessPool(object):
+    """ A dead simple Process Pool
+        that allows processes themselves to use os.fork().
+    """
+    def __init__(self, jobs):
+        self._jobs = jobs
+        self._pids = []
+        self._rc = 0
+
+    def run(self, func, *args):
+        """ Run function 'func' with arguments *args """
+        while len(self._pids) >= self._jobs:
+            self.wait()
+        pid = os.fork()
+        if pid == 0:
+            # child
+            sys.exit(func(*args))
+        elif pid != -1:
+            self._pids.append(pid)
+
+    def wait(self):
+        """ Wait for one child to finish. """
+        pid, status = os.wait()
+        self._pids.remove(pid)
+        if self._rc == 0:
+            self._rc = os.waitstatus_to_exitcode(status)
+
+    def wait_all(self):
+        """ Wait for all children to finish. """
+        while len(self._pids) > 0:
+            self.wait()
+
+        return self._rc
+
+class BalanceLock(object):
+    """ A lock object for balance checks
+
+        Objects of this type are initialized with two function names,
+        for locking/unlocking respectively. The check() method can be
+        used on a c_ast.FuncCall node to update the internal state.
+        balanced() will then tell if the state is coherent.
+    """
+    def __init__(self, name, fname_plus, fname_minus):
+        self._counter = 0
+        self._name = name
+        self._plus = fname_plus
+        self._minus = fname_minus
+
+    def __repr__(self):
+        return "%s=%r" % (self._name, self._counter)
+
+    def name(self):
+        return self._name
+
+    def function_names(self):
+        return self._plus, self._minus
+
+    def balanced(self):
+        return self._counter == 0
+
+    def check(self, node):
+        if not isinstance(node, c_ast.FuncCall):
+            raise TypeError
+
+        # XXX Need to handle UnaryOp, too?
+        if not isinstance(node.name, c_ast.ID):
+            return False
+
+        action = True
+        if node.name.name == self._plus:
+            self._counter += 1
+        elif node.name.name == self._minus:
+            self._counter -= 1
+        else:
+            action = False
+        return action
+
+
+class LockStatus(object):
+    """ A container to keep track of multiple locking status. """
+
+    def __init__(self, locks):
+        self._locks = locks
+
+    def __repr__(self):
+        return 'LockStatus(' + ','.join('%r' % (l) for l in self._locks) + ')'
+
+    def __eq__(self, other):
+        if not isinstance(other, LockStatus):
+            raise TypeError
+        if len(self._locks) != len(other._locks):
+            return False
+        for i in range(len(self._locks)):
+            if self._locks[i] != other._locks[i]:
+                return False
+        return True
+
+    def __ne__(self, other):
+        if not isinstance(other, LockStatus):
+            raise TypeError
+        return not self.__eq__(other)
+
+    def lockfuncs(self):
+        """ Return all locking function names """
+        r = []
+        for l in self._locks:
+            r.extend(l.function_names())
+        return r
+
+    def balanced(self):
+        for l in self._locks:
+            if not l.balanced():
+                return False
+        return True
+
+    def check(self, node):
+        if not isinstance(node, c_ast.FuncCall):
+            raise TypeError
+
+        r = False
+        for l in self._locks:
+            r |= l.check(node)
+        return r
+
+class LockError(Exception):
+    def __init__(self, reason, lockstatus: LockStatus):
+        self._lockstatus = lockstatus
+        self._reason = reason
+
+    def status(self):
+        return self._lockstatus
+
+    def reason(self):
+        return "Error: " + self._reason
+
+class Return(LockError):
+    def __init__(self, lockstatus: LockStatus):
+        LockError.__init__(self,
+                "Unbalanced lock status at return statement.",
+                lockstatus)
+
+class Break(LockError):
+    def __init__(self, lockstatus: LockStatus):
+        LockError.__init__(self,
+                "Unbalanced lock status at break statement.",
+                lockstatus)
+
+class Continue(LockError):
+    def __init__(self, lockstatus: LockStatus):
+        LockError.__init__(self,
+                "Unbalanced lock status at continue statement.",
+                lockstatus)
+
+class NoError(Exception):
+    pass
+
+class CheckVisitor(c_ast.NodeVisitor):
+    """ AST visitor
+
+        Provides callbacks for all kinds of "interesting" nodes that we want to
+        introspect in the AST.
+    """
+    def __init__(self, root, locks, debug=False):
+        self._root = root
+        if isinstance(locks, LockStatus):
+            self._lockstatus = locks
+        else:
+            self._lockstatus = LockStatus(locks)
+        self._forbidden = False             # is changing lock status forbidden?
+        self._ignore = None           # Ignore further processing upto this node
+        self._debug = debug
+        self._ifcond = {}             # Dict of if conditions (not) taken in this visit
+
+    def dbg(self, str):
+        if not self._debug:
+            return
+        ignore = ", ignored (%s)" % (self._ignore.name)  if self._ignore else ""
+        forbidden = ", forbidden" if self._forbidden else ""
+        print("[%x] %s statement%s%s" % (os.getpid(), str, ignore, forbidden))
+
+    def balanced(self):
+        return self._lockstatus.balanced()
+
+    def status(self):
+        return self._lockstatus
+
+    def root(self):
+        return self._root
+
+    def ignoring(self):
+        return self._ignore != None
+
+    def needs_visit(self, node):
+        """ Return if checking a node is necessary. """
+
+        if node is None:
+            return False
+
+        # Check if sub-tree contains our goto label
+        if self._ignore:
+            if self._ignore in get_nodes(node, c_ast.Label):
+                return True
+            # Consider gotos, we might jump somewhere interesting
+            return get_nodes(node, c_ast.Goto)
+
+        # Check for locking functions
+        called_fns = get_nodes(node, c_ast.FuncCall)
+        for fn in called_fns:
+            if not isinstance(fn.name, c_ast.ID):
+                continue
+            if fn.name.name in self.status().lockfuncs():
+                return True
+
+        return False
+
+    def visit(self, node):
+        """ Wrapper for c_ast.NodeVisitor.visit() that checks for None. """
+        if node is None:
+            return
+        c_ast.NodeVisitor.visit(self, node)
+
+    def visit_cond(self, node):
+        """ Visit a loop condition, where it is forbidden to use locking functions. """
+        self._forbidden = True
+        self.visit(node.cond)
+        self._forbidden = False
+
+    def visit_loop(self, node):
+        """ Visit a loop body. Continue flow from here on break/continue. """
+        try:
+            self.visit(node.stmt)
+        except (Break, Continue):
+            return False
+        return True
+
+    def jumps_backwards(self, pivot, node):
+        """ Check if a Goto node jumps backwards.
+
+            Search AST starting from node if the label or goto-statement
+            for the pivot comes first.
+        """
+        if node is None:
+            return
+        if pivot is None:
+            return
+        if not isinstance(pivot, c_ast.Goto):
+            raise TypeError
+
+        label_before_goto = None
+        for c in [item[1] for item in node.children()]:
+            if isinstance(c, c_ast.Label) and c.name == pivot.name:
+                label_before_goto = True
+            elif c is pivot:
+                label_before_goto = False
+            else:
+                label_before_goto = self.jumps_backwards(pivot, c)
+
+            if label_before_goto is not None:
+                break
+
+        return label_before_goto
+
+    def is_function(self, node, name):
+        """ Return if the given FuncCall node is the named function. """
+        if not isinstance(node, c_ast.FuncCall):
+            raise TypeError
+
+        # XXX Need to handle UnaryOp, too?
+        if not isinstance(node.name, c_ast.ID):
+            return False
+
+        if node.name.name == name:
+            return True
+        return False
+
+    def endless_loop(self, node):
+        """ Check if this node is an endless loop. """
+
+        # While loops
+        if isinstance(node, c_ast.While) or isinstance(node, c_ast.DoWhile):
+            # while (1) { ... }
+            return isinstance(node.cond, c_ast.Constant) and node.cond.value == 1
+
+        # For loops
+        if isinstance(node, c_ast.For):
+            # for (;;) { ... }
+            return node.init is None and node.cond is None and node.next is None
+
+        raise TypeError
+
+    def collect_ifcond(self, node, visited):
+        """ Save the condition from the If node as visited. """
+        if not isinstance(node, c_ast.If):
+            raise TypeError
+
+        cond = GnuCGenerator().visit(node.cond)
+        if not cond in self._ifcond.keys():
+            self._ifcond[cond] = visited
+
+    def known_ifcond(self, node):
+        """ Return which branch of the If node we have taken previously. """
+        if not isinstance(node, c_ast.If):
+            raise TypeError
+
+        cond = GnuCGenerator().visit(node.cond)
+        if cond in self._ifcond.keys():
+            return self._ifcond[cond]
+        return None
+
+
+
+    ###
+    # visitor routines below
+    ###
+
+    def visit_FuncCall(self, node):
+        """ Function call visitor
+
+            Let the lock status check for necessary changes, when calling
+            lock operations.
+        """
+        self.dbg("Call %s" % (node.name.name if isinstance(node.name, c_ast.ID) else "?"))
+        if self._ignore:
+            return
+
+        lockop = self._lockstatus.check(node)
+        if lockop and self._forbidden:
+            raise LockError("Lock operation in risky place performed.",
+                            lockstatus)
+
+        # Handle panic() as end-of-function.
+        # Locks are busted at this point anyway.
+        if (self.is_function(node, "panic")):
+            raise NoError
+
+        self.generic_visit(node)
+
+    def visit_Return(self, node):
+        """ Return statement visitor
+
+            After evaluating a return statement the lock status needs to be
+            balanced.
+        """
+        self.dbg("Return")
+        if self._ignore:
+            return
+
+        self.generic_visit(node)
+        if not self.balanced():
+            raise Return(self._lockstatus)
+        else:
+            raise NoError
+
+    def visit_If(self, node):
+        """ If-clause visitor
+
+            Both blocks are handled in separate branches.
+            If we have seen the condition before, enter the same branch again.
+        """
+        self.dbg("If")
+        if not self.needs_visit(node):
+            return
+
+        self.visit_cond(node)
+
+        b = self.known_ifcond(node)
+        if b is None:
+            # Condition is not knwon, yet.
+            branched = False
+            if self.needs_visit(node.iffalse):
+                branched = branch()
+                if branched:
+                    self.collect_ifcond(node, False)
+                    self.visit(node.iffalse)
+            if not branched and self.needs_visit(node.iftrue):
+                self.collect_ifcond(node, True)
+                self.visit(node.iftrue)
+        elif b is True and self.needs_visit(node.iftrue):
+            # We took the true branch previously.
+            self.visit(node.iftrue)
+        elif b is False and self.needs_visit(node.iffalse):
+            # We took the false branch previously.
+            self.visit(node.iffalse)
+
+    def visit_TernaryOp(self, node):
+        return self.visit_If(node)
+
+    def visit_Label(self, node):
+        """ Label visitor
+
+            Check if this is a forward-jump and unignore the path.
+        """
+        if self._ignore is node:
+            self._ignore = None
+        self.dbg("Label %s" % (node.name))
+
+        self.generic_visit(node)
+
+    def visit_Goto(self, node):
+        """ Goto visitor
+
+            Check if this is a backwards jump and finish if it is.
+            There is no meaningful statement on the lock status in this
+            case. If this is a forward jump, set to ignore all sub-
+            sequent nodes upto the label.
+        """
+        self.dbg("Goto %s" % (node.name))
+        if self._ignore:
+            return
+
+        if self.jumps_backwards(node, self._root):
+            # We have visited past labels by definition.
+            raise NoError
+
+        # This is a forward goto. Ignore all nodes, upto the respective label.
+        for l in get_nodes(self._root, c_ast.Label):
+            if l.name == node.name:
+                assert (self._ignore is None)
+                self._ignore = l
+        self.generic_visit(node)
+
+    def visit_Switch(self, node):
+        """ Switch statement visitor
+
+            Visit each case in a separate branch.
+        """
+        self.dbg("Switch")
+        if not self.needs_visit(node):
+            return
+
+        self.visit_cond(node)
+
+        cases = None
+        if isinstance(node.stmt, c_ast.Compound):
+            cases = node.stmt.block_items
+        elif isinstance(node.stmt, c_ast.Case) or isinstance(node.stmt, c_ast.Default):
+            cases = [ node.stmt ]
+        else:
+            raise RuntimeError("Unhandled case in switch statement.")
+
+        fallthrough = False
+        for case in cases:
+            if not fallthrough:
+                if branch():
+                    continue
+
+            try:
+                self.visit(case)
+                fallthrough = True
+            except Break:
+                # XXX handle goto to labels in remaining cases
+                return
+
+    def visit_While(self, node):
+        """ While loop visitor
+
+            Splits the flow into condition was taken and
+            condition was not taken.
+
+            Abort this analysis flow on an endless loop.
+        """
+        self.dbg("While")
+        if not self.needs_visit(node):
+            return
+
+        self.visit_cond(node)
+
+        if branch():
+            self.visit_loop(node)
+
+        if self.endless_loop(node):
+            raise NoError
+
+    def visit_DoWhile(self, node):
+        """ DoWhile loop visitor
+
+            Visit loop body, and visit loop condition when body finished.
+            Abort this analysis flow on an endless loop,
+            if the loop condition was evaluated.
+        """
+        self.dbg("DoWhile")
+        if not self.needs_visit(node):
+            return
+
+        if self.visit_loop(node):
+            self.visit_cond(node)
+            if self.endless_loop(node):
+                raise NoError
+
+    def visit_For(self, node):
+        """ For loop visitor
+
+            Loop conditions are forbidden for locking functions.
+        """
+        self.dbg("For")
+        if not self.needs_visit(node):
+            return
+
+        self._forbidden = True
+        self.visit(node.init)
+        self.visit(node.cond)
+        self.visit(node.next)
+        self._forbidden = False
+
+        if branch():
+            self.visit_loop(node)
+
+        if self.endless_loop(node):
+            raise NoError
+
+    def visit_Break(self, node):
+        """ Break visitor -- breaks out of a loop by raising an exception. """
+        self.dbg("Break")
+        self.generic_visit(node)
+        raise Break(self.status())
+
+    def visit_Continue(self, node):
+        """ Continue visitor -- breaks out of a loop by raising an exception. """
+        self.dbg("Continue")
+        self.generic_visit(node)
+        raise Continue(self.status())
+
+
+def check_ast(filename, ast, locks):
+    """ Check a complete AST for errors
+
+        Check each function of the AST for common errors,
+        especially lock ballancing errors.
+    """
+    funcs = get_nodes(ast, c_ast.FuncDef)
+    #pprint(funcs)
+    r = 1
+    for f in funcs:
+        try:
+            forked = False
+            v = CheckVisitor(f, locks, f.decl.name == None)
+            if not v.needs_visit(v.root()):
+                continue
+            forked = branch()
+            if forked:
+                #print(filename + ": " + f.decl.name + "()")
+                v.visit(f)
+                if not v.ignoring() and not v.balanced():
+                    raise LockError("Unbalanced lock status at end of function.",
+                                    v.status())
+                #print(filename + ": " + f.decl.name + "(): ok")
+            r = 0
+        except NoError:
+            pass
+        except (Break, Continue):
+            raise RuntimeError("Break/Continue exception at function root.")
+        except LockError as e:
+            # This is normal reporting; it goes to stdout!
+            print(filename + ": " + f.decl.name + "(): " +
+                  e.reason() + " " + repr(e.status()),
+                  file=sys.stdout)
+        except RecursionError:
+            print(format_exc(), file=sys.stderr)
+            print("Error in " + filename + ":" + f.decl.name + "()",
+                  file=sys.stderr)
+        except Exception as e:
+            print("An exception occured: " + str(e), file=sys.stderr)
+            print(format_exc(), file=sys.stderr)
+        finally:
+            if forked:
+                sys.exit(r)
+
+    return r
+
+def strip_unknown(text):
+    """ Strip unknown C literals from a text
+
+        pycparse does not handle certain C literals (mostly GCC extensions).
+        Strip them off of the given text.
+
+        text:
+            Freestanding and preprocessed C code as string.
+
+        The stripped text is returned.
+    """
+
+    def first_arg(text):
+        start = 0
+        while text[start] == '(':
+            start += 1
+        end = text.find(',')
+        if end == -1:
+            raise c_parser.ParseError("Failed to parse argument")
+        return text[start:end-1]
+
+    def remove_function(text, needle, with_params = True, replace_by = ''):
+        """ Remove a function with parameters in parenthesis. """
+        while True:
+            start = text.find(needle)
+            if start == -1:
+                break
+            end = start + len(needle)
+            while text[end] == ' ':
+                end += 1
+            if with_params:
+                depth = 0
+                if text[end] != '(':
+                    raise c_parser.ParseError("Failed to strip '" + needle + "' [" +
+                            str(start) + "," + str(end) + "]\n\n" + text[start-20:end+20])
+                if callable(replace_by):
+                    replace_by = replace_by(text[end+1:])
+                for i in text[end:]:
+                    if i == '(':
+                        depth = depth + 1
+                    if i == ')':
+                        depth = depth - 1
+                    end += 1
+                    if depth == 0:
+                        break
+                while text[end] == " ":
+                    end += 1
+            if replace_by != '':
+                replace_by = " " + replace_by.strip() + " "
+            text = text[:start] + replace_by + text[end:]
+        return text
+
+
+    # Remove some GCC extensions.
+    text = remove_function(text, "__attribute__")
+    text = remove_function(text, "__builtin_offsetof", replace_by = "0")
+    text = remove_function(text, "__typeof", replace_by = "int")
+
+    # Remove inline/volatile decorators
+    text = remove_function(text, "__inline__", with_params = False)
+    text = remove_function(text, "__inline", with_params = False)
+    text = remove_function(text, "__volatile__", with_params = False)
+    text = remove_function(text, "__volatile", with_params = False)
+
+    # Handle va_{start,arg,end}
+    text = remove_function(text, "__builtin_va_start")
+    text = remove_function(text, "__builtin_va_arg", replace_by = first_arg)
+    text = remove_function(text, "__builtin_va_end")
+
+    return text
+
+def check_file(file, locks):
+    """ Prepare and check the given file for errors in locks. """
+    r = 0
+    with open(file) as f:
+        c = f.read()
+
+    if not c:
+        return 0
+
+    parser = GnuCParser()
+    try:
+        ast = parser.parse(strip_unknown(c), file)
+        r = check_ast(file, ast, locks)
+    except c_parser.ParseError:
+        e = sys.exc_info()[1]
+        print("Cannot parse " + file + ": " + str(e), file=sys.stderr)
+        r = 1
+
+    return r
+
+LOCKS = {
+        'DEFAULT': [
+            BalanceLock('spl', 'splraise', 'spllower'),
+            BalanceLock('mpl', '__mp_lock', '__mp_unlock'),
+            BalanceLock('mtx', 'mtx_enter', 'mtx_leave'), # XXX mtx_enter_try
+        ],
+}
+
+def main():
+    global rc
+
+    rc = 0
+    argparser = ArgumentParser('OpenBSD kernel lock balance checker')
+    argparser.add_argument('filename',
+                           nargs='*',
+                           help='Name of file(s) to check.')
+    argparser.add_argument('-M', help='Machine architecture.',
+                           action='store_true')
+    argparser.add_argument('-j', help='Number of parallel jobs.',
+                           type=int, default=1)
+    argparser.add_argument('-l', help='List (comma-separated) of locks to check. [mpl,mtx,spl]',
+                           nargs=1)
+    args = argparser.parse_args()
+
+    locks = LOCKS['DEFAULT']
+    if args.M and args.M in LOCKS:
+        locks = LOCKS[args.M]
+
+    l = []
+    for n in args.l[0].split(','):
+        l += filter(lambda x: x.name() == n, locks)
+    if not l:
+        l = locks
+
+    pool = ProcessPool(args.j)
+
+    i = 0
+    for file in args.filename:
+        if sys.stderr.isatty():
+            out = "[%6.2f%%] %s" % (i * 100 / len(args.filename), file)
+            print(out.ljust(get_terminal_size().columns),
+                  end='\r',
+                  file=sys.stderr)
+
+        pool.run(check_file, file, l)
+        #rc |= check_file(file, l)
+        i += 1
+
+    rc |= pool.wait_all()
+    sys.exit(rc)
+
+if __name__ == "__main__":
+    main()

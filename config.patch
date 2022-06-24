@@ -1,0 +1,85 @@
+commit 965217b72cc7312bffe7897b62f07b940442b9e5
+Author: Christian Ludwig <cludwig@genua.de>
+Date:   Wed Jun 22 19:12:25 2022 +0000
+
+    Check kernel builds for common errors
+    
+    Introduce a 'lbc' make target for kernel builds that runs a script on
+    the kernel build files to check for common C programming errors.
+    
+    The script uses Python's pycparserext to analyze the preprocessed
+    kernel build files. It implements domain-specific knowledge to check
+    certain aspects of how the kernel uses certain C constructs.
+    
+    It has to be installed separately.
+
+diff --git a/sys/arch/amd64/conf/Makefile.amd64 b/sys/arch/amd64/conf/Makefile.amd64
+index d2704424f34..1fc030350b6 100644
+--- a/sys/arch/amd64/conf/Makefile.amd64
++++ b/sys/arch/amd64/conf/Makefile.amd64
+@@ -87,6 +87,7 @@ HOSTED_C=	${HOSTCC} ${HOSTED_CFLAGS} ${HOSTED_CPPFLAGS} -c $<
+ 
+ NORMAL_C_NOP=	${CC} ${CFLAGS} ${CPPFLAGS} -fno-ret-protector -c $<
+ NORMAL_C=	${CC} ${CFLAGS} ${CPPFLAGS} ${PROF} -c $<
++NORMAL_I=	${CC} -E ${CFLAGS} ${CPPFLAGS} ${PROF} -c $< >$@
+ NORMAL_S=	${CC} ${AFLAGS} ${CPPFLAGS} ${PROF} -c $<
+ 
+ %OBJS
+@@ -131,6 +132,22 @@ CFLAGS+=	-fno-wrapv
+ 
+ %LOAD
+ 
++NCPU!= sysctl -n hw.ncpuonline
++.PHONY: lbc
++lbc: ${OBJS:.o=.i}
++	@if ! which lbc 2>/dev/null >&2 ; then \
++	    echo "Please install lbc" >&2 ; \
++	    exit 1 ; \
++	fi
++	lbc -j${NCPU} -l spl  $>
++
+ # cc's -MD puts the source and output paths in the dependency file;
+ # since those are temp files here we need to fix it up.  It also
+ # puts the file in /tmp, so we use -MF to put it in the current
+diff --git a/usr.sbin/config/mkmakefile.c b/usr.sbin/config/mkmakefile.c
+index f98d34dff41..62f37176502 100644
+--- a/usr.sbin/config/mkmakefile.c
++++ b/usr.sbin/config/mkmakefile.c
+@@ -426,10 +426,19 @@ emitrules(FILE *fp)
+ 	/* write suffixes */
+ 	if (fprintf(fp,
+ 	    ".SUFFIXES:\n"
+-	    ".SUFFIXES: .s .S .c .o\n\n"
++	    ".SUFFIXES: .s .S .c .o .i\n\n"
+ 
+ 	    ".PHONY: depend all install clean tags newbsd update-link\n\n"
+ 
++	    ".c.i:\n"
++	    "\t${NORMAL_I}\n\n"
++
++	    ".s.i:\n"
++	    "\ttouch $@\n\n"
++
++	    ".S.i:\n"
++	    "\ttouch $@\n\n"
++
+ 	    ".c.o:\n"
+ 	    "\t${NORMAL_C}\n\n"
+ 
+@@ -450,12 +459,16 @@ emitrules(FILE *fp)
+ 		if (fi->fi_mkrule) {
+ 			if (emit_1rule(fp, fi, fpath, ".o"))
+ 				return (1);
++
+ 		/* simple default rule */
+ 		} else {
+ 			if (fprintf(fp, "%s.o: %s%s\n", fi->fi_base,
+ 			    *fpath != '/' ? "$S/" : "", fpath) < 0)
+ 				return (1);
+ 		}
++		if (fprintf(fp, "%s.i: %s%s\n", fi->fi_base,
++		    *fpath != '/' ? "$S/" : "", fpath) < 0)
++			return (1);
+ 
+ 	}
+ 	return (0);
